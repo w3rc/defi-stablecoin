@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.21;
 
-import {INRCoin} from "./INRStableCoin.sol";
+import {INRCoin} from "./INRCoin.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
@@ -23,6 +23,7 @@ contract INRCEngine is ReentrancyGuard {
     error INRCEngine__TokenNotAllowed();
     error INRCEngine__TransferFailed();
     error INRCEngine__BreaksHealthFactor(uint256 healthFactor);
+    error INRCEngine__MintFailed();
 
     /////////////////////////
     // State variables  /////
@@ -41,12 +42,13 @@ contract INRCEngine is ReentrancyGuard {
 
     uint256 private s_USDToINRPrice;
 
-    INRCoin private immutable inrCoin;
+    INRCoin private immutable i_inrCoin;
 
     ////////////////
     // Events  /////
     ////////////////
     event CollateralDeposited(address indexed user, address indexed token, uint256 indexed amount);
+    event CollateralRedeemed(address indexed user, address indexed token, uint256 indexed amount);
 
     ////////////////
     // Modifiers  //
@@ -80,20 +82,35 @@ contract INRCEngine is ReentrancyGuard {
         for (uint256 i = 0; i < tokenAddresses.length; i++) {
             s_priceFeeds[tokenAddresses[i]] = priceFeedAddresses[i];
         }
-        inrCoin = INRCoin(inrcTokenContractAddress);
+        i_inrCoin = INRCoin(inrcTokenContractAddress);
     }
 
     /////////////////////////
     // External Functions  //
     /////////////////////////
-    function depositCollateralAndMintINRC() external {}
+
+    /**
+     *
+     * @param collateralContractAddress Address of the token to be deposited as collateral
+     * @param collateralAmount Amount of collateral to deposit
+     * @param amountOfINRCToMint The amount of INRC to mint
+     * @notice This function will be used to deposit collaterla and mint INRC
+     */
+    function depositCollateralAndMintINRC(
+        address collateralContractAddress,
+        uint256 collateralAmount,
+        uint256 amountOfINRCToMint
+    ) external {
+        depositCollateral(collateralContractAddress, collateralAmount);
+        mintINRC(amountOfINRCToMint);
+    }
 
     /**
      * @param collateralContractAddress Address of the token to be deposited as collateral
      * @param collateralAmount Amount of collateral to deposit
      */
     function depositCollateral(address collateralContractAddress, uint256 collateralAmount)
-        external
+        public
         moreThanZero(collateralAmount)
         allowedTokensOnly(collateralContractAddress)
         nonReentrant
@@ -106,20 +123,56 @@ contract INRCEngine is ReentrancyGuard {
         }
     }
 
-    function redeemCollateralForINRC() external {}
+    /**
+     * @param tokenCollateralAddress Address of the collateral token
+     * @param collateralAmount Amount of collateral
+     * @param inrcAmountToBurn Amount of INRC to burn
+     */
+    function redeemCollateralForINRC(address tokenCollateralAddress, uint256 collateralAmount, uint256 inrcAmountToBurn)
+        external
+    {
+        burnINRC(inrcAmountToBurn);
+        redeemCollateral(tokenCollateralAddress, collateralAmount);
+    }
 
-    function redeemCollateral() external {}
+    function redeemCollateral(address tokenCollateralAddress, uint256 collateralAmount)
+        public
+        moreThanZero(collateralAmount)
+        nonReentrant
+    {
+        s_collateralsDeposited[msg.sender][tokenCollateralAddress] -= collateralAmount;
+        emit CollateralRedeemed(msg.sender, tokenCollateralAddress, collateralAmount);
+
+        bool success = IERC20(tokenCollateralAddress).transfer(msg.sender, collateralAmount);
+        if (!success) {
+            revert INRCEngine__TransferFailed();
+        }
+        _revertIfHealthFactorIsBroken(msg.sender);
+    }
 
     /**
      * @param amountOfINRCToMint The amount of INRC to mint
      * @dev Check if collateral value is greater than INRC amount
      */
-    function mintINRC(uint256 amountOfINRCToMint) external moreThanZero(amountOfINRCToMint) nonReentrant {
+    function mintINRC(uint256 amountOfINRCToMint) public moreThanZero(amountOfINRCToMint) nonReentrant {
         s_INRCMinted[msg.sender] += amountOfINRCToMint;
         _revertIfHealthFactorIsBroken(msg.sender);
+        bool minted = i_inrCoin.mint(msg.sender, amountOfINRCToMint);
+        if (!minted) {
+            revert INRCEngine__MintFailed();
+        }
     }
 
-    function burnINRC() external {}
+    function burnINRC(uint256 amount) public moreThanZero(amount) {
+        s_INRCMinted[msg.sender] -= amount;
+
+        bool success = i_inrCoin.transferFrom(msg.sender, address(this), amount);
+        if (!success) {
+            revert INRCEngine__TransferFailed();
+        }
+        i_inrCoin.burn(amount);
+        _revertIfHealthFactorIsBroken(msg.sender); // ???
+    }
 
     function liquidate() external {}
 
@@ -172,7 +225,7 @@ contract INRCEngine is ReentrancyGuard {
     function getUsdValue(address token, uint256 amount) public view returns (uint256) {
         AggregatorV3Interface priceFeed = AggregatorV3Interface(s_priceFeeds[token]);
         (, int256 price,,,) = priceFeed.latestRoundData();
-        return ((uint256(price) * ADDITIONAL_FEED_PRECISION) * amount) / 1e18;
+        return ((uint256(price) * ADDITIONAL_FEED_PRECISION) * amount) / PRECISION;
     }
 
     function getInrValue(address token, uint256 amount) public view returns (uint256) {

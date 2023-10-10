@@ -19,7 +19,7 @@ contract INRCoin is ERC20Burnable, Ownable {
     error INRCoin__CannotMintToZeroAddress();
     error INRCoin__MustMintMoreThanZero();
 
-    constructor() ERC20("INRCoin", "INRC") Ownable(address(0)) {}
+    constructor() ERC20("INRCoin", "INRC") Ownable(address(msg.sender)) {}
 
     function burn(uint256 _amount) public override onlyOwner {
         uint256 balance = balanceOf(msg.sender);
