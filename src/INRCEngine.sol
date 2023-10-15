@@ -251,6 +251,8 @@ contract INRCEngine is ReentrancyGuard {
      */
     function _getHealthFactor(address user) private view returns (uint256) {
         (uint256 totalINRCMinted, uint256 totalCollateralValueInINR) = _getAccountInfo(user);
+        if (totalINRCMinted == 0) return type(uint256).max;
+
         uint256 collateralAdjustedForThreshold =
             (totalCollateralValueInINR * LIQUIDATION_THRESHOLD) / LIQUIDATION_PRECISION;
         return (collateralAdjustedForThreshold * PRECISION) / totalINRCMinted;
@@ -307,7 +309,36 @@ contract INRCEngine is ReentrancyGuard {
         return s_collateralTokens;
     }
 
-    function getCollateralDeposited(address user, address token) external view returns (uint256) {
+    function getCollateralBalanceOfUser(address user, address token) external view returns (uint256) {
         return s_collateralsDeposited[user][token];
     }
+
+     function getCollateralTokenPriceFeed(address token) external view returns (address) {
+        return s_priceFeeds[token];
+    }
+
+      function getMinHealthFactor() external pure returns (uint256) {
+        return MIN_HEALTH_FACTOR;
+    }
+
+    function getPrecision() external pure returns (uint256) {
+        return PRECISION;
+    }
+
+    function getAdditionalFeedPrecision() external pure returns (uint256) {
+        return ADDITIONAL_FEED_PRECISION;
+    }
+
+        function getLiquidationThreshold() external pure returns (uint256) {
+        return LIQUIDATION_THRESHOLD;
+    }
+
+    function getLiquidationBonus() external pure returns (uint256) {
+        return LIQUIDATION_BONUS;
+    }
+
+      function getInrc() external view returns (address) {
+        return address(i_inrCoin);
+    }
+
 }
