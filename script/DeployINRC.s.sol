@@ -22,7 +22,10 @@ contract DeployINRC is Script {
         vm.startBroadcast(deployerKey);
 
         INRCoin inrcCoin = new INRCoin();
-        INRCEngine inrcEngine = new INRCEngine(tokenAddresses, priceFeedAddresses, address(inrcCoin));
+
+        uint256 intialUsdToInrConversionRate = 90;
+        INRCEngine inrcEngine =
+            new INRCEngine(tokenAddresses, priceFeedAddresses, address(inrcCoin), intialUsdToInrConversionRate);
 
         inrcCoin.transferOwnership(address(inrcEngine));
 

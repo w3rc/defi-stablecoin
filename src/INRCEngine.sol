@@ -20,10 +20,12 @@ contract INRCEngine is ReentrancyGuard {
     ////////////////
     error INRCEngine__AmountShouldBeGreaterThanZero();
     error INRCEngine__NumberOfTokenAddressesAndPriceFeedAddressesShouldBeSame();
-    error INRCEngine__TokenNotAllowed();
+    error INRCEngine__TokenNotAllowed(address tokenAddress);
     error INRCEngine__TransferFailed();
     error INRCEngine__BreaksHealthFactor(uint256 healthFactor);
     error INRCEngine__MintFailed();
+    error INRCEngine__FundsAreHealthy();
+    error INRCEngine__FundsStillUnhealthy();
 
     /////////////////////////
     // State variables  /////
@@ -33,6 +35,7 @@ contract INRCEngine is ReentrancyGuard {
     uint256 private constant LIQUIDATION_THRESHOLD = 50;
     uint256 private constant LIQUIDATION_PRECISION = 100;
     uint256 private constant MIN_HEALTH_FACTOR = 1;
+    uint256 private constant LIQUIDATION_BONUS = 10; // 10%
 
     mapping(address token => address priceFeed) private s_priceFeeds;
     mapping(address user => mapping(address token => uint256 amount)) private s_collateralsDeposited;
@@ -48,7 +51,9 @@ contract INRCEngine is ReentrancyGuard {
     // Events  /////
     ////////////////
     event CollateralDeposited(address indexed user, address indexed token, uint256 indexed amount);
-    event CollateralRedeemed(address indexed user, address indexed token, uint256 indexed amount);
+    event CollateralRedeemed(
+        address indexed redeemedFrom, address indexed redeemedTo, address indexed token, uint256 amount
+    );
 
     ////////////////
     // Modifiers  //
@@ -62,7 +67,7 @@ contract INRCEngine is ReentrancyGuard {
 
     modifier allowedTokensOnly(address tokenContractAddress) {
         if (s_priceFeeds[tokenContractAddress] == address(0)) {
-            revert INRCEngine__TokenNotAllowed();
+            revert INRCEngine__TokenNotAllowed(tokenContractAddress);
         }
         _;
     }
@@ -73,7 +78,8 @@ contract INRCEngine is ReentrancyGuard {
     constructor(
         address[] memory tokenAddresses,
         address[] memory priceFeedAddresses,
-        address inrcTokenContractAddress
+        address inrcTokenContractAddress,
+        uint256 intialUsdToInrConversionRate
     ) {
         if (tokenAddresses.length != priceFeedAddresses.length) {
             revert INRCEngine__NumberOfTokenAddressesAndPriceFeedAddressesShouldBeSame();
@@ -81,8 +87,10 @@ contract INRCEngine is ReentrancyGuard {
 
         for (uint256 i = 0; i < tokenAddresses.length; i++) {
             s_priceFeeds[tokenAddresses[i]] = priceFeedAddresses[i];
+            s_collateralTokens.push(tokenAddresses[i]);
         }
         i_inrCoin = INRCoin(inrcTokenContractAddress);
+        s_USDToINRPrice = intialUsdToInrConversionRate;
     }
 
     /////////////////////////
@@ -140,13 +148,7 @@ contract INRCEngine is ReentrancyGuard {
         moreThanZero(collateralAmount)
         nonReentrant
     {
-        s_collateralsDeposited[msg.sender][tokenCollateralAddress] -= collateralAmount;
-        emit CollateralRedeemed(msg.sender, tokenCollateralAddress, collateralAmount);
-
-        bool success = IERC20(tokenCollateralAddress).transfer(msg.sender, collateralAmount);
-        if (!success) {
-            revert INRCEngine__TransferFailed();
-        }
+        _redeemCollateral(tokenCollateralAddress, collateralAmount, msg.sender, msg.sender);
         _revertIfHealthFactorIsBroken(msg.sender);
     }
 
@@ -164,23 +166,74 @@ contract INRCEngine is ReentrancyGuard {
     }
 
     function burnINRC(uint256 amount) public moreThanZero(amount) {
-        s_INRCMinted[msg.sender] -= amount;
-
-        bool success = i_inrCoin.transferFrom(msg.sender, address(this), amount);
-        if (!success) {
-            revert INRCEngine__TransferFailed();
-        }
-        i_inrCoin.burn(amount);
+        _burnINRC(amount, msg.sender, msg.sender);
         _revertIfHealthFactorIsBroken(msg.sender); // ???
     }
 
-    function liquidate() external {}
+    /**
+     * If someone is almost undercollaterized you will be paid to liquidate them
+     * @param collateral The collateral token address
+     * @param user The user whose health factor is broken. Healthfactor should always be below MIN_HEALTH_FACTOR
+     * @param debtToCover AMount of INRC to burn to improve health factor of the user
+     * @notice You will get liquidation bonus for taking user's funds
+     */
+    function liquidate(address collateral, address user, uint256 debtToCover)
+        external
+        moreThanZero(debtToCover)
+        nonReentrant
+    {
+        uint256 startingUserHealthFactor = _getHealthFactor(user);
+        if (startingUserHealthFactor >= MIN_HEALTH_FACTOR) {
+            revert INRCEngine__FundsAreHealthy();
+        }
 
-    function getHealthFactor() external view {}
+        uint256 tokenAmountFromDebtCovered = getTokenAmountFromInr(collateral, debtToCover);
+        uint256 bonusCollateral = (tokenAmountFromDebtCovered * LIQUIDATION_BONUS) / LIQUIDATION_PRECISION;
+
+        uint256 totalCollateralToRedeem = tokenAmountFromDebtCovered + bonusCollateral;
+        _redeemCollateral(collateral, totalCollateralToRedeem, user, msg.sender);
+        _burnINRC(debtToCover, user, msg.sender);
+
+        uint256 endingUserHealthFactor = _getHealthFactor(user);
+        if (endingUserHealthFactor <= startingUserHealthFactor) {
+            revert INRCEngine__FundsStillUnhealthy();
+        }
+        _revertIfHealthFactorIsBroken(msg.sender);
+    }
+
+    function setUsdToInrPrice(uint256 value) external {
+        s_USDToINRPrice = value;
+    }
+
+    function getHealthFactor(address user) external view returns (uint256) {
+        return _getHealthFactor(user);
+    }
 
     ///////////////////////////////////
     // Private & Internal Functions  //
     ///////////////////////////////////
+
+    function _redeemCollateral(address tokenCollateralAddress, uint256 collateralAmount, address from, address to)
+        private
+    {
+        s_collateralsDeposited[from][tokenCollateralAddress] -= collateralAmount;
+        emit CollateralRedeemed(from, to, tokenCollateralAddress, collateralAmount);
+
+        bool success = IERC20(tokenCollateralAddress).transfer(to, collateralAmount);
+        if (!success) {
+            revert INRCEngine__TransferFailed();
+        }
+    }
+
+    function _burnINRC(uint256 amountOfINRCToBurn, address onBehalfOf, address inrcFrom) private {
+        s_INRCMinted[onBehalfOf] -= amountOfINRCToBurn;
+
+        bool success = i_inrCoin.transferFrom(inrcFrom, address(this), amountOfINRCToBurn);
+        if (!success) {
+            revert INRCEngine__TransferFailed();
+        }
+        i_inrCoin.burn(amountOfINRCToBurn);
+    }
 
     function _getAccountInfo(address user)
         private
@@ -213,6 +266,16 @@ contract INRCEngine is ReentrancyGuard {
     ///////////////////////////////////
     // Public & External Functions  ///
     ///////////////////////////////////
+    function getTokenAmountFromUsd(address token, uint256 usdAmountInWei) public view returns (uint256) {
+        AggregatorV3Interface priceFeed = AggregatorV3Interface(s_priceFeeds[token]);
+        (, int256 price,,,) = priceFeed.latestRoundData();
+        return (usdAmountInWei * PRECISION) / (uint256(price) * ADDITIONAL_FEED_PRECISION);
+    }
+
+    function getTokenAmountFromInr(address token, uint256 inrAmountInWei) public view returns (uint256) {
+        return getTokenAmountFromUsd(token, (inrAmountInWei / s_USDToINRPrice)) * s_USDToINRPrice;
+    }
+
     function getAccountCollateralValue(address user) public view returns (uint256 totalCollateralValueInINR) {
         for (uint256 i = 0; i < s_collateralTokens.length; i++) {
             address token = s_collateralTokens[i];
@@ -230,5 +293,21 @@ contract INRCEngine is ReentrancyGuard {
 
     function getInrValue(address token, uint256 amount) public view returns (uint256) {
         return getUsdValue(token, amount) * s_USDToINRPrice;
+    }
+
+    function getAccountInformation(address user)
+        external
+        view
+        returns (uint256 totalINRCMinted, uint256 collateralValueInINR)
+    {
+        return _getAccountInfo(user);
+    }
+
+    function getCollateralTokens() external view returns (address[] memory) {
+        return s_collateralTokens;
+    }
+
+    function getCollateralDeposited(address user, address token) external view returns (uint256) {
+        return s_collateralsDeposited[user][token];
     }
 }

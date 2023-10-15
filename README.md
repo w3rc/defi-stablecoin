@@ -9,3 +9,8 @@
     -> wETH
     -> wBTC
 
+
+## Commands
+
+Perform Individual test -> `forge test --match-test <testName>`
+

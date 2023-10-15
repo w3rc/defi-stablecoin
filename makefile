@@ -27,6 +27,8 @@ build:; forge build
 
 test :; forge test 
 
+test-m :; forge test --match-test ${TEST}
+
 test-fork :; forge test  --fork-url ${SEPOLIA_RPC_URL} --via-ir
 
 snapshot :; forge snapshot
